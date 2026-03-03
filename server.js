@@ -1,46 +1,13 @@
 const express   = require("express");
-const axios     = require("axios");
 const cheerio   = require("cheerio");
 const cors      = require("cors");
 const NodeCache = require("node-cache");
+const puppeteer = require("puppeteer");
 
 const app   = express();
 const cache = new NodeCache({ stdTTL: 600 });
 
-app.use(cors({
-  origin: "*", // open during dev — restrict to your domain later
-  methods: ["GET"],
-}));
-
-// Rotate through several realistic User-Agents
-const USER_AGENTS = [
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-];
-const randomUA = () => USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-
-async function fetchPage(url) {
-  const { data, status } = await axios.get(url, {
-    timeout: 20000,
-    headers: {
-      "User-Agent":      randomUA(),
-      "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-      "Accept-Language": "en-US,en;q=0.9",
-      "Accept-Encoding": "gzip, deflate, br",
-      "Cache-Control":   "no-cache",
-      "Pragma":          "no-cache",
-      "Referer":         "https://www.novelupdates.com/",
-      "DNT":             "1",
-      "Connection":      "keep-alive",
-      "Upgrade-Insecure-Requests": "1",
-      "Sec-Fetch-Dest":  "document",
-      "Sec-Fetch-Mode":  "navigate",
-      "Sec-Fetch-Site":  "same-origin",
-    },
-  });
-  return { data, status };
-}
+app.use(cors({ origin: "*", methods: ["GET"] }));
 
 const GENRE_MAP = {
   "action": 8, "adult": 280, "adventure": 13, "comedy": 17,
@@ -54,61 +21,109 @@ const GENRE_MAP = {
   "xuanhuan": 481, "yaoi": 560, "yuri": 80,
 };
 
+// ── Launch a single shared browser instance ──────────────────────────
+let browser = null;
+async function getBrowser() {
+  if (!browser) {
+    browser = await puppeteer.launch({
+      headless: "new",
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-accelerated-2d-canvas",
+        "--no-first-run",
+        "--no-zygote",
+        "--single-process",
+        "--disable-gpu",
+      ],
+    });
+    console.log("Browser launched");
+  }
+  return browser;
+}
+
+// ── Fetch a URL using a real headless Chrome tab ─────────────────────
+async function fetchWithPuppeteer(url) {
+  const br   = await getBrowser();
+  const page = await br.newPage();
+
+  try {
+    // Disguise as a real browser
+    await page.setUserAgent(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    );
+    await page.setExtraHTTPHeaders({
+      "Accept-Language": "en-US,en;q=0.9",
+      "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    });
+
+    // Block images/fonts to speed things up
+    await page.setRequestInterception(true);
+    page.on("request", (req) => {
+      if (["image", "font", "stylesheet", "media"].includes(req.resourceType())) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
+
+    console.log("Loading:", url);
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+
+    // Wait for novel cards to appear
+    await page.waitForSelector(".search_main_box_nu, .w-blog-entry", { timeout: 10000 })
+      .catch(() => console.log("Selector timeout — parsing whatever loaded"));
+
+    const html = await page.content();
+    return html;
+  } finally {
+    await page.close();
+  }
+}
+
+// ── Parse the HTML with Cheerio ──────────────────────────────────────
 function parsePage($) {
   const novels = [];
 
-  // Try multiple possible container selectors
-  const containers = $(".search_main_box_nu, .w-blog-entry-inner, .bsl-nu");
-
-  console.log(`Found ${containers.length} novel containers`);
-
-  containers.each((i, el) => {
+  $(".search_main_box_nu").each((i, el) => {
     const $el = $(el);
 
-    // Title — try multiple selectors
-    const titleEl = $el.find(".search_title a, .w-blog-entry-title a, h2 a").first();
+    const titleEl = $el.find(".search_title a").first();
     const title   = titleEl.text().trim();
     const link    = titleEl.attr("href") || "";
     const slug    = link.replace("https://www.novelupdates.com/series/", "").replace(/\/$/, "");
 
-    // Cover image
-    const image = $el.find("img").first().attr("src")
-               || $el.find("img").first().attr("data-src")
+    const image = $el.find(".search_img_nu img").attr("src")
+               || $el.find(".search_img_nu img").attr("data-src")
                || "";
 
-    // Rating
-    const ratingText = $el.find(".search_ratings .userrate, .nuicon-star").first().text().trim();
+    const ratingText = $el.find(".search_ratings .nuicon-star-rate-o").parent().text().trim();
     const rating     = parseFloat(ratingText) || null;
-    const votesMatch = $el.find(".search_ratings").text().match(/\((\d[\d,]*)/);
+    const votesMatch = $el.text().match(/\((\d[\d,]*)\s*x\)/);
     const votes      = parseInt((votesMatch?.[1] || "0").replace(/,/g, ""));
 
-    // Description
-    const desc = $el.find(".search_body_nu, .w-blog-entry-excerpt").text()
-                     .replace(/\s+/g, " ").trim();
+    const desc = $el.find(".search_body_nu").text().replace(/\s+/g, " ").trim();
 
-    // Genres
     const genres = [];
-    $el.find(".genre-item a, .w-blog-entry-genre a").each((_, g) => genres.push($(g).text().trim()));
+    $el.find(".genre-item a").each((_, g) => genres.push($(g).text().trim()));
 
-    // Stats
-    const scoreText = $el.find(".search_score_nu, .w-blog-entry-meta").text();
-    const chapters  = scoreText.match(/(\d[\d,]*)\s+(?:Releases|Chapters)/i)?.[1]?.replace(/,/g, "") || null;
+    const scoreText = $el.find(".search_score_nu").text();
+    const chapters  = scoreText.match(/(\d[\d,]*)\s+Releases/i)?.[1]?.replace(/,/g, "") || null;
     const readers   = scoreText.match(/([\d,]+)\s+Readers/i)?.[1]?.replace(/,/g, "") || null;
-    const status    = $el.find(".ss, .search_score_nu").text().includes("Complete") ? "Complete" : "Ongoing";
+    const status    = scoreText.includes("Complete") ? "Complete" : "Ongoing";
 
-    if (title) {
-      novels.push({ title, link, slug, image, rating, votes, desc, genres, chapters, readers, status });
-    }
+    if (title) novels.push({ title, link, slug, image, rating, votes, desc, genres, chapters, readers, status });
   });
 
-  const hasNext = $(".digg_pagination a.next_page, a.next_page").length > 0;
+  const hasNext = $(".digg_pagination a.next_page").length > 0;
   return { novels, hasNext };
 }
 
-// ── /api/novels ──────────────────────────────────────────────────────
+// ── GET /api/novels ──────────────────────────────────────────────────
 app.get("/api/novels", async (req, res) => {
   try {
-    const { sort = "sdate", genre = null, page = 1, search = null } = req.query;
+    const { sort = "latest", genre = null, page = 1, search = null } = req.query;
     const pg = parseInt(page) || 1;
 
     let url = "https://www.novelupdates.com/series-finder/?sf=1&langs=1";
@@ -125,66 +140,59 @@ app.get("/api/novels", async (req, res) => {
     const cached   = cache.get(cacheKey);
     if (cached) return res.json({ ...cached, cached: true });
 
-    console.log("Fetching:", url);
-    const { data, status } = await fetchPage(url);
-    console.log("HTTP status:", status);
+    const html = await fetchWithPuppeteer(url);
+    const $    = cheerio.load(html);
 
-    const $ = cheerio.load(data);
-
-    // Cloudflare / bot check detection
-    const pageTitle = $("title").text();
-    console.log("Page title:", pageTitle);
-    if (pageTitle.toLowerCase().includes("just a moment") || pageTitle.toLowerCase().includes("cloudflare")) {
-      return res.status(503).json({ error: "Blocked by Cloudflare", detail: "NovelUpdates returned a bot-check page. Try again in a few seconds." });
+    // Detect Cloudflare block
+    if ($("title").text().toLowerCase().includes("just a moment")) {
+      return res.status(503).json({ error: "Cloudflare challenge — retry in a few seconds" });
     }
 
     const { novels, hasNext } = parsePage($);
 
     if (novels.length === 0) {
-      // Return raw snippet for debugging
-      console.log("No novels found. HTML snippet:", data.slice(0, 2000));
       return res.status(500).json({
-        error: "No novels parsed — HTML structure may have changed",
-        htmlSnippet: data.slice(0, 1000),
+        error: "No novels parsed",
+        pageTitle: $("title").text(),
+        htmlSnippet: html.slice(0, 800),
       });
     }
 
-    const response = { novels, hasMore: hasNext, page: pg, total: novels.length, cached: false };
+    const response = { novels, hasMore: hasNext, page: pg, cached: false };
     cache.set(cacheKey, response);
     res.json(response);
 
   } catch (err) {
-    console.error("Error:", err.message);
+    console.error(err);
+    // Reset browser on crash so next request gets a fresh one
+    if (browser) { await browser.close().catch(() => {}); browser = null; }
     res.status(500).json({ error: "Scrape failed", detail: err.message });
   }
 });
 
-// ── /api/debug — shows raw HTML to help diagnose selector issues ──────
+// ── GET /api/debug ───────────────────────────────────────────────────
 app.get("/api/debug", async (req, res) => {
   try {
-    const url = "https://www.novelupdates.com/series-finder/?sf=1&langs=1&sort=sdate&order=desc";
-    const { data } = await fetchPage(url);
-    const $ = cheerio.load(data);
+    const url  = "https://www.novelupdates.com/series-finder/?sf=1&langs=1&sort=sdate&order=desc";
+    const html = await fetchWithPuppeteer(url);
+    const $    = cheerio.load(html);
     res.json({
-      title:        $("title").text(),
-      bodyClasses:  $("body").attr("class"),
-      firstDivs:    $("div").slice(0, 5).map((i, el) => $(el).attr("class")).get(),
+      title:          $("title").text(),
       containerCount: $(".search_main_box_nu").length,
-      html500:      data.slice(0, 500),
+      firstTitle:     $(".search_title a").first().text(),
+      htmlSnippet:    html.slice(0, 1000),
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── Health ────────────────────────────────────────────────────────────
-app.get("/", (req, res) => res.json({
-  status: "ok",
-  endpoints: {
-    list:  "/api/novels?sort=latest|rating|readers|chapters&genre=action|fantasy|...&page=1&search=...",
-    debug: "/api/debug",
-  },
-}));
+// ── Health check ─────────────────────────────────────────────────────
+app.get("/", (req, res) => res.json({ status: "ok", message: "NovelUpdates scraper running (Puppeteer)" }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Running on port ${PORT}`));
+app.listen(PORT, async () => {
+  console.log(`Server on port ${PORT}`);
+  // Pre-warm the browser on startup
+  await getBrowser().catch(console.error);
+});
