@@ -10,5 +10,5 @@
     "node-cache": "^5.1.2",
     "cloudscraper": "^4.6.0"
   },
-  "engines": { "node": "18.x" }
+  "engines": { "node": "16.x" }
 }
